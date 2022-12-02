@@ -1,0 +1,482 @@
+
+
+---
+title: "Analyzing Amazon Product Reviews"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the required libraries
+
+```{r}
+#Clean Rstudio environment  
+rm(list=ls())
+```
+
+```{r,include=FALSE}
+#install.packages("textdata")
+library(tidyverse) 
+library(tidytext) 
+library(textdata)
+library(gridExtra) #viewing multiple plots together 
+library(widyr)
+library(ggraph)
+library(igraph)
+```
+
+## Read in the data 
+```{r, include=FALSE}
+amazon_original <-read_csv("1429_1.csv")
+```
+Data comes from https://www.kaggle.com/datasets/bittlingmayer/amazonreviews and has been modified prior to analysis.
+
+```{r, include=FALSE}
+names(amazon_original)
+```
+
+## Modify the dataset
+```{r, include=FALSE}
+#1 Limiting columns to product name, review text, categories, recommendation, and rating
+amazon <-amazon_original %>% 
+  select (name,text=reviews.text, categories, reviews.doRecommend,reviews.rating)
+```
+
+
+```{r, include=FALSE}
+#2 Group reviews by product name and display number of reviews for each product
+amazon %>% 
+  group_by(name)%>% 
+  count(name)%>% 
+  arrange(desc(name))
+```
+
+
+```{r, include=FALSE}
+# Create a separate table for products that groups information for each product together
+name <- amazon$name
+products<-split(amazon,name)
+```
+
+
+```{r, include=FALSE}
+# Limit reviews to the Fire Tablet and Fire TV
+product1<-products[[1]]
+product2<-products[[16]]
+
+products <- bind_rows(product1%>% 
+                      mutate(name = "Fire Tablet"),
+                     product2%>% 
+                      mutate(name = "Fire TV")
+                     ) 
+```
+
+## Tokenize and preprocess text
+
+```{r, include=FALSE}
+# Remove contractions
+
+fix.contractions <- function(doc) {
+  # "won't" is a special case as it does not expand to "wo not"
+  doc <- gsub("won't", "will not", doc)
+  doc <- gsub("can't", "can not", doc)
+  doc <- gsub("n't", " not", doc)
+  doc <- gsub("'ll", " will", doc)
+  doc <- gsub("'re", " are", doc)
+  doc <- gsub("'ve", " have", doc)
+  doc <- gsub("'m", " am", doc)
+  doc <- gsub("'d", " would", doc)
+  # 's could be 'is' or could be possessive: it has no expansion
+  doc <- gsub("'s", "", doc)
+  return(doc)
+}
+
+# fix (expand) contractions
+products$text <- sapply(products $text, fix.contractions)
+```
+ 
+
+```{r, include=FALSE}
+# List of undesirable words
+undesirable_words <- c("amazon","tablet", "echo","alexa","kindle","fire")
+
+# Remove stop words, undesirable words, and words with 2 or fewer characters
+tidy <-products %>%
+  unnest_tokens("word",text)%>%
+  anti_join(stop_words)%>%
+  filter (!word %in% undesirable_words) %>%
+  filter(nchar(word) > 2)
+
+tidy$word <- gsub("\\s+","", tidy$word)
+tidy$word <- gsub("[^a-zA-Z]","", tidy$word)
+```
+
+## Word Frequesncy
+
+```{r, echo=FALSE}
+# Determine the top 20 most popular words for each product
+popular_words <- tidy %>% 
+  group_by(name) %>%
+  count(word, name, sort = TRUE) %>%
+  top_n(20) %>%
+  ungroup() %>%
+  arrange(name,n) %>%
+  mutate(row = row_number()) 
+
+popular_words %>%
+  ggplot(aes(row, n, fill = name)) +
+  geom_col(show.legend = NULL) +
+  labs(x = NULL, y = NULL) +
+  ggtitle("Popular Words by Products") + 
+  facet_wrap(~name, ncol = 3, scales = "free") +
+  scale_x_continuous(  # This handles replacement of row 
+    breaks = popular_words$row, # notice need to reuse data frame
+    labels = popular_words$word) +
+  coord_flip()
+```
+
+From the graphic, we can see that price is a concern for the Fire Tablet, but it is not in the top words for the Fire TV. For both devices, ease of use ("easy") is a frequently mentioned word. Functionality is also discussed for both the Fire Tablet ("apps", "books", "games", "reading") and the Fire TV ("music", "weather", "speaker", "news").
+
+## Tf-idf
+
+```{r , echo=FALSE}
+# Calculate TF-IDF to find unique words
+popular_tfidf_words <- tidy %>%
+  count(name, word, sort = TRUE) %>%
+  ungroup() %>%
+  bind_tf_idf(word, name, n)
+
+head(popular_tfidf_words)
+```
+
+Based on this information, the most popular are frequently used in other reviews such that they have an idf of 0.
+
+
+```{r, echo=FALSE}
+# Arrange popular words by highest TF-IDF and plot them
+top_popular_tfidf_words <- popular_tfidf_words %>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>%
+  group_by(name) %>% 
+  slice(seq_len(20)) %>%
+  ungroup() %>%
+  arrange(name, tf_idf) %>%
+  mutate(row = row_number())
+
+top_popular_tfidf_words %>%
+  ggplot(aes(x = row, tf_idf, 
+             fill = name)) +
+    geom_col(show.legend = NULL) +
+    labs(x = NULL, y = "TF-IDF") + 
+    ggtitle("Important Words using TF-IDF by products") +
+    facet_wrap(~name, ncol = 3, scales = "free") +
+    scale_x_continuous(  # This handles replacement of row 
+    breaks = top_popular_tfidf_words$row, # notice need to reuse data frame
+      labels = top_popular_tfidf_words$word) +
+    coord_flip()
+```
+
+From this graphic, we can see the unique words for the Fire Tablet reviews pertain to issues with the product ("screen", "replace"). The unique words for the Fire TV reviews include more niche uses for the product ("jokes", "thermostat", "timers").
+
+## Sentiment analysis 
+Implement sentiment analysis using the inner join function and different lexicons by performing an inner_join() on the get_sentiments() function.
+
+```{r}
+# Get the lexicons
+bing<-get_sentiments("bing")
+nrc<-get_sentiments("nrc")
+afinn<-get_sentiments("afinn")
+
+# Convert AFINN to negative and positive
+afinn_neg_pos <- afinn %>%
+  mutate( sentiment = ifelse( value >= 0, "positive",
+                              ifelse( value < 0,
+                                     "negative", value)))
+afinn_neg_pos <-afinn_neg_pos %>%
+  select(word, sentiment)
+
+# Look at Match Ratios
+# Combine lexicons
+sentiments <- bind_rows(list(bing=bing,nrc=nrc,afinn=afinn_neg_pos),.id = "lexicon")
+sentiments <- sentiments %>% 
+  group_by(lexicon) %>%
+  mutate(words_in_lexicon = n_distinct(word)) %>%
+  ungroup()
+
+tidy %>% 
+  mutate(words_in_reviews = n_distinct(word)) %>%
+  inner_join(sentiments) %>%
+  group_by(lexicon,words_in_reviews, words_in_lexicon) %>%
+  summarise(lex_match_words = n_distinct(word)) %>%
+  ungroup() %>%
+  mutate(total_match_words = sum(lex_match_words), #Not used but good to have
+         match_ratio = lex_match_words / words_in_reviews) %>%
+  select(lexicon, lex_match_words,  words_in_reviews, match_ratio)
+
+# NRC has the highest match ratio
+
+tidy_bing <- tidy %>% 
+  inner_join(bing)
+tidy_nrc <- tidy %>% 
+  inner_join(nrc)
+tidy_afinn <- tidy %>% 
+  inner_join(afinn)
+```
+
+
+## positive and negative words for each product 
+It's important to understand which words specifically are driving sentiment scores, and since we are using tidy data principles, it's not too difficult to check.
+
+Product: Fire HD 8 Tablet
+
+```{r fig.height = 7, fig.width = 7, fig.align = "center",warning=FALSE,message=FALSE, echo=FALSE}
+tidy_bing <- tidy%>%
+filter(name == "Fire Tablet") %>%
+ # Count by word and sentiment
+ inner_join(get_sentiments("bing"))%>%
+ count(word, sentiment, sort = TRUE) %>%
+ group_by(sentiment) %>%
+ # Take the top  words for each sentiment
+ top_n(20,n) %>%
+ ungroup() %>%
+ mutate(word = reorder(word, n)) %>%
+ # Set up the plot with aes()
+ ggplot(aes(word,n, fill=sentiment)) +
+ geom_col(show.legend = FALSE) +
+ facet_wrap(~ sentiment, ncol =5, scales = "free") +
+  ggtitle("Sentiment for Fire HD 8 Tablet") +
+ coord_flip()+
+scale_x_reordered()
+
+tidy_bing
+```
+
+This graphic shows that the top negative words are contradictory descriptions of price ("cheap" & "expensive"). Other common negative words deal with issues with the product such as "slow", "broke", "lag", and "freezes". The common positive words include praise for the product ("love", "nice", "recommend", "perfect") and features ("fast", "easy").
+
+## Polarity
+
+We can break down the analysis using the Bing lexicon.
+
+```{r,warning=FALSE,message=FALSE, echo=FALSE}
+# Pull in Bing lexicon
+tidy_bing <- tidy %>%
+ inner_join(get_sentiments("bing"))
+
+# Calculate polarity
+polarity <- tidy_bing %>%
+ count(sentiment, name) %>%
+ spread(sentiment, n, fill = 0) %>%
+ mutate(polarity = positive - negative,
+ percent_positive = positive / (positive + negative) * 100)
+
+# Chart polarity
+polarity %>%
+  ggplot(aes(name, polarity, fill=name)) +
+  geom_col(show.legend = FALSE) +
+  xlab(NULL) +
+  ylab(NULL) +
+  ggtitle("Polarity by Product")
+```
+
+Looking at the polarity, both products have an overwhelmingly positive sentiment.
+
+## Bigrams
+
+Product: Fire HD 8 Tablet
+
+```{r, echo=FALSE, include=FALSE}
+#bigram for Fire Tablet
+bigrams <- product1 %>%
+  unnest_tokens(bigram, text, token = "ngrams", n = 2)
+
+#bigrams
+# Separate bigrams into two columns, word1 & word2
+bigrams_separated <- bigrams %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+# Filter bigrams, exclude stop words and words with 3 or fewer characters
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word)%>%
+  filter(nchar(word1) > 3)%>%
+  filter(nchar(word2) > 3)
+bigrams_filtered
+
+# Recombine bigrams
+bigrams_united <- bigrams_filtered %>%
+  unite(bigram, word1, word2, sep = " ")
+#bigrams_united
+```
+
+Count the most common bigrams.
+```{r, echo=FALSE}
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+bigram_counts
+```
+
+The top two bigrams reference the product ("kindle fire" & "amazon fire"). The other top bigrams include product features ("battery life", "play games", "read books", & "user friendly").
+
+```{r, echo=FALSE}
+# filter for only relatively common combinations
+bigram_graph <- bigram_counts %>%
+  filter(n > 10) %>%
+  graph_from_data_frame((directed = FALSE))
+
+bigram_graph
+
+set.seed(2017)
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), show.legend = FALSE,edge_colour = "cyan4") +
+  geom_node_point(size = 1) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+Based on this graphic, we can see the strong links around the product name ("kindle" to "fire"). This chain for the product name also links to the features of the tablet  ("size", "screen", "resolution") through positive qualifiers ("nice", "perfect"). We can also see links around different activities like games ("google", "play"), reading ("read", "books"), and movies ("netflix", "watch", "videos").
+
+## Topic modeling
+```{r, echo=FALSE}
+# Create tidy data set & filter out stop words, undesirable words, words less than 2 characters, white spaces, and numbers
+tidy <-amazon %>%
+  unnest_tokens("word",text)%>%
+  anti_join(stop_words)%>%
+  filter (!word %in% undesirable_words) %>%
+  filter(nchar(word) > 2)
+
+tidy$word <- gsub("\\s+","", tidy$word)
+tidy$word <- gsub("[^a-zA-Z]","", tidy$word)
+
+
+# Cast tidy data into a matrix
+dtm <- tidy %>%
+  count(name, word) %>%
+  cast_dtm(name, word, n)
+```
+
+
+```{r , echo=FALSE}
+library(topicmodels)
+
+#Perform topic modeling with 4 topics
+
+topic_model<-LDA(dtm, k=4, control = list(seed = 1234))
+topic_model
+```
+
+## Beta Matrix
+```{r, echo=FALSE}
+# Calculate beta matrix for per-word probabilty of being in each topic
+topics <-tidy(topic_model, matrix = "beta")
+
+
+topics%>%
+#let's group_by each topic
+  group_by(topic)%>%
+#take the top 10 words in each topic
+  top_n(10)%>%
+  ungroup%>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+    ggplot(aes(term, beta, fill = topic)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ topic, scales = "free") +
+    coord_flip() +
+    labs(x = NULL, y = expression(beta),
+         title = "Highest word probabilities for each topic",
+         subtitle = "Different words are associated with different topics")+
+scale_x_reordered()
+
+```
+
+Based on the graphic, the topics are grouped around reading (topic 1), TV (topic 2), kids (topic 4). Topic 3 is not as clearly defined with words like "music", "home", "sound", and "weather". Topic 3 could refer to a multi-functional product. 
+
+## Gamma Matrix
+```{r, echo=FALSE}
+# Calculate Gamma matrix of probability of each review belonging to each of the 4 topics
+td_gamma <-  tidy(topic_model, matrix = "gamma", document_names = rownames(pride_dfm))
+
+ggplot(td_gamma, aes(gamma, fill = as.factor(topic))) +
+  #a histogram of gamma
+  #we don't need to see the legend
+  geom_histogram(show.legend = FALSE) +
+  #show the graphs in three columns
+  facet_wrap(~ topic, ncol = 2) +
+  labs(title = "Distribution of document probabilities for each topic",
+              y = "Number of products", x = expression(gamma))
+```
+
+
+Topics 1,3, and 4 have products that are clearly associated with them. However, topic 2 only has a few products that have a high probability of being associated with it.
+
+
+## Additional Question
+
+What is the difference in sentiment between the best rated product (highest average rating) and the least recommended product (lowest average rating)?
+
+```{r}
+# Determine products with the highest # of "Yes" recommendations, limit to products that have at least 100 reviews to limit impact of a single rating
+amazon %>% 
+  group_by(name) %>%
+  summarise(rating = mean(reviews.rating, na.rm = TRUE), count = n()) %>% 
+  filter(count > 100) %>% 
+  arrange(desc(rating))
+```
+
+The Amazon Fire Hd 10 Tablet, Wi-Fi, 16 Gb, Special Offers - Silver Aluminum has the highest average rating, and the All-New Fire HD 8 Tablet, 8 HD Display, Wi-Fi, 32 GB - Includes Special Offers, Magenta has the lowest average rating.
+
+## Pre-process & Filter Data
+```{r}
+# Pre-process the data and filter to relevant 2 products
+name <- amazon$name
+products<-split(amazon,name)
+
+product1<-products[[2]]
+product2<-products[[11]]
+
+products <- bind_rows(product1%>% 
+                      mutate(name = "All-New Fire HD 8 Tablet"),
+                     product2%>% 
+                      mutate(name = "Fire HD 10 Tablet")
+                     ) 
+
+# Remove contractions
+products$text <- sapply(products $text, fix.contractions)
+
+# Remove stop words, undesirable words, and words with 2 or fewer characters
+tidy_ratings <-products %>%
+  unnest_tokens("word",text)%>%
+  anti_join(stop_words)%>%
+  filter (!word %in% undesirable_words) %>%
+  filter(nchar(word) > 2)
+
+tidy_ratings$word <- gsub("\\s+","", tidy_ratings$word)
+tidy_ratings$word <- gsub("[^a-zA-Z]","", tidy_ratings$word)
+
+```
+## Sentiment Analysis and Comparison
+```{r}
+# Want to examine sentiments associated with each product, so we will use the NRC lexicon
+
+tidy_ratings_nrc <- tidy_ratings %>% 
+  inner_join(get_sentiments("nrc"))
+
+tidy_ratings_nrc %>% 
+  count(sentiment,name,sort = TRUE)%>% 
+  group_by(sentiment)%>%
+  top_n(5)%>%
+  ungroup()%>%
+  #mutate(word=reorder (word,n))%>%
+  ggplot(aes(name,n,fill=sentiment))+
+    geom_col(show.legend = FALSE)+
+    facet_wrap(~sentiment,ncol=3,scales = "free_y")+
+    labs(y="nrc - contribution to sentiment",x=NULL)+
+    coord_flip()
+```
+
+Based on the sentiment comparison between the two products, we can see that the Fire HD 10 Tablet (the higher rated product) had much fewer words with negative sentiments (anger, disgust, fear) when compared to the lower rated All-New Fire HD 8 Tablet. However, the All-New Fire HD 8 Tablet has more sentiment words than the Fire HD 10 Tablet across all sentiments. The differences in between the two products is evident in the gap in the number of words with each sentiment. The differences in the two products can be seen in the absolute difference between the number of sentiment words. The difference in negative words is much greater when compared to the difference in positive words.

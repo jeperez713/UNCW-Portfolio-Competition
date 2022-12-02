@@ -1,0 +1,145 @@
+---
+output:
+  word_document: default
+  html_document: default
+---
+## Exploring Age at First Marriage
+### Julia Perez
+
+Data from https://www.kaggle.com/datasets/thedevastator/median-age-at-first-marriage-in-america
+
+```{r Libraries, include = FALSE}
+library(tidymodels)
+library(tidyverse)
+library(skimr)
+library(ggcorrplot)
+library(GGally)
+library(gridExtra)
+library(caret)
+library(vip)
+library(VIM)
+library(mice)
+library(ranger)
+library(glmnet)
+library(MASS)
+library(car)
+library(lmtest)
+library(splines)
+library(e1071)
+library(ROCR)
+library(randomForest)
+library(xgboost)
+library(usemodels)
+library(readxl)
+```
+
+### Import Data
+```{r Import}
+marriage <- read_csv("Median Age at First Marriage .csv")
+head(marriage)
+
+marriage <- marriage %>% 
+  rename(Age = 'Median Age', Pop.Density = 'Population Density per Sq Mi', State = Name) %>% 
+  mutate(across(where(is_character),as_factor))
+```
+
+### Exploratory Data Analysis
+```{r EDA}
+ggplot(marriage, aes(Age)) +
+  geom_boxplot()
+
+ggplot(marriage, aes(State, Age, color = TimeFrame)) +
+  geom_point() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  labs(x = "State")
+# See a trend of median marriage age increasing over time
+
+ggplot(marriage, aes(Pop.Density, Age)) +
+  geom_point() +
+  scale_x_log10() +
+  geom_smooth(method = lm)
+# As the log of population density increases, so does the median age of marriage
+```
+
+
+### Train & Test Split
+```{r Split}
+set.seed(123)
+
+marriage_split <- initial_split(marriage, prop = 0.80, Age)
+train <- training(marriage_split)
+test <- testing(marriage_split)
+```
+
+### Linear Model
+```{r LM}
+age_recipelm <- recipe(Age ~ State + TimeFrame + Pop.Density, train) %>%
+  step_log(Pop.Density) %>% 
+  step_dummy(all_nominal(), -all_outcomes())
+
+age_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+age_wkflw1 <- workflow() %>% 
+  add_model(age_model) %>% 
+  add_recipe(age_recipelm)
+
+lm_fit_all <- fit(age_wkflw1, train)
+summary(lm_fit_all$fit$fit$fit)
+```
+
+This model shows that only Louisiana, Wisconsin, and TimeFrame are statistically significant. Adjusted R-squared 0.96.
+
+```{r Refine LM}
+# Likely correlation between State and Pop.Density, trying models with just State and Time Frame
+age_recipe_state <- recipe(Age ~ State + TimeFrame, train) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+age_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+age_wkflw_state <- workflow() %>% 
+  add_model(age_model) %>% 
+  add_recipe(age_recipe_state)
+
+lm_fit_state <- fit(age_wkflw_state, train)
+summary(lm_fit_state$fit$fit$fit)
+
+# In this model, more states have a statistically significant impact on median marriage age. Adjusted R-squared shows only a very slight improvement.
+
+# Model just using Pop.Density and TimeFrame
+age_recipe_pop <- recipe(Age ~ TimeFrame + Pop.Density, train) %>%
+  step_log(Pop.Density) %>% 
+  step_dummy(all_nominal(), -all_outcomes())
+
+age_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+age_wkflw_pop <- workflow() %>% 
+  add_model(age_model) %>% 
+  add_recipe(age_recipe_pop)
+
+lm_fit_pop <- fit(age_wkflw_pop, train)
+summary(lm_fit_pop$fit$fit$fit)
+
+# Although Pop.Density and TimeFrame are both significant variables, the adjusted R-squared shows a large decrease to 0.691.
+```
+
+We will use the model with State and TimeFrame.
+
+### Performance on Test Set
+```{r Test}
+lm_fit_state %>%
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = Age, estimate = .pred)
+```
+
+The R-squared on this model is 0.72 which does suggest that this model is not overfitting.
+
+
+
